@@ -298,6 +298,10 @@ bx_ne2k_c::write_cr(Bit32u value)
     printf("");
 #endif    
 
+	/*
+	Sending Here
+	*/
+	
     // Send the packet to the system driver
 	/* TODO: Transmit packet */
     //BX_NE2K_THIS ethdev->sendpkt(& BX_NE2K_THIS s.mem[BX_NE2K_THIS s.tx_page_start*256 - BX_NE2K_MEMSTART], BX_NE2K_THIS s.tx_bytes);
@@ -1468,6 +1472,10 @@ static void NE2000_TX_Event(Bitu val) {
 }
 
 static void NE2000_Poller(void) {
+	/*
+	TODO: option to disable pcap and read from udp tunnel
+	*/
+	
 	int res;
 	struct pcap_pkthdr *header;
 	u_char *pkt_data;
@@ -1495,6 +1503,9 @@ private:
 	IO_WriteHandleObject WriteHandler16[0x10];
 
 public:
+	/*
+		TODO: option to strip all the pcap out
+	*/
 	bool load_success;
 	NE2K(Section* configuration):Module_base(configuration) {
 		Section_prop * section=static_cast<Section_prop *>(configuration);
