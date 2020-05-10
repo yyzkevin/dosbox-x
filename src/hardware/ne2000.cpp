@@ -18,6 +18,7 @@
 #include "cpu.h"
 #include "setup.h"
 #include "control.h"
+#include "SDL_net.h"
 
 /* Couldn't find a real spec for the NE2000 out there, hence this is adapted heavily from Bochs */
 
@@ -57,6 +58,13 @@
 // Handle to WinPCap device
 pcap_t *adhandle = 0;
 static void NE2000_TX_Event(Bitu val);
+
+UDPsocket ne_tunnel;
+int ne_tunnel_chan;
+int tunnel_mode;
+Bit8u ne_tunnel_rx[1520];
+
+
 
 #ifdef WIN32
 // DLL loading
@@ -298,20 +306,32 @@ bx_ne2k_c::write_cr(Bit32u value)
     printf("");
 #endif    
 
-	/*
-	Sending Here
-	*/
-	
     // Send the packet to the system driver
 	/* TODO: Transmit packet */
     //BX_NE2K_THIS ethdev->sendpkt(& BX_NE2K_THIS s.mem[BX_NE2K_THIS s.tx_page_start*256 - BX_NE2K_MEMSTART], BX_NE2K_THIS s.tx_bytes);
-	pcap_sendpacket(adhandle,&s.mem[s.tx_page_start*256 - BX_NE2K_MEMSTART], s.tx_bytes);
-	// some more debug
+    
+    if (tunnel_mode) {
+        UDPpacket packet;
+        int result;
+        packet.channel = ne_tunnel_chan;
+        //packet.data = (Uint8*)&BX_NE2K_THIS s.mem[(BX_NE2K_THIS s.tx_page_start * 256 - BX_NE2K_MEMSTART);
+        packet.data = &s.mem[(BX_NE2K_THIS s.tx_page_start * 256 - BX_NE2K_MEMSTART)];
+        packet.len = BX_NE2K_THIS s.tx_bytes;
+        packet.maxlen = BX_NE2K_THIS s.tx_bytes;
+        result = SDLNet_UDP_Send(ne_tunnel, ne_tunnel_chan, &packet);
+        printf("\nUDP Send: %u\n", result);
+        if (!result) printf("problems sending udp: %s\n", SDLNet_GetError());
+    }
+    else {
+        pcap_sendpacket(adhandle, &s.mem[s.tx_page_start * 256 - BX_NE2K_MEMSTART], s.tx_bytes);
+    }
+
+    // some more debug
 	if (BX_NE2K_THIS s.tx_timer_active) {
       BX_PANIC(("CR write, tx timer still active"));
 	  PIC_RemoveEvents(NE2000_TX_Event);
 	}
-	//LOG_MSG("send packet command");
+	LOG_MSG("send packet command!");
 	//s.tx_timer_index = (64 + 96 + 4*8 + BX_NE2K_THIS s.tx_bytes*8)/10;
 	s.tx_timer_active = 1;
 	PIC_AddEvent(NE2000_TX_Event,(float)((64 + 96 + 4*8 + BX_NE2K_THIS s.tx_bytes*8)/10000.0),0);
@@ -1278,7 +1298,7 @@ bx_ne2k_c::rx_frame(const void *buf, unsigned io_len)
   unsigned char *startptr;
   static unsigned char bcast_addr[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
 
-  if(io_len != 60) {
+    if(io_len != 60) {
 	BX_DEBUG("rx_frame with length %d", io_len);
   }
 
@@ -1472,23 +1492,32 @@ static void NE2000_TX_Event(Bitu val) {
 }
 
 static void NE2000_Poller(void) {
-	/*
-	TODO: option to disable pcap and read from udp tunnel
-	*/
-	
-	int res;
-	struct pcap_pkthdr *header;
-	u_char *pkt_data;
-//#if 0
-	while((res = pcap_next_ex( adhandle, &header, (const u_char **)&pkt_data)) > 0) {
-		//LOG_MSG("NE2000: Received %d bytes", header->len);
-		
-		// don't receive in loopback modes
-		if((theNE2kDevice->s.DCR.loop == 0) || (theNE2kDevice->s.TCR.loop_cntl != 0))
-			return;
-		theNE2kDevice->rx_frame(pkt_data, header->len);
-	}
-//#endif
+    int res;
+    struct pcap_pkthdr* header;
+    u_char* pkt_data;
+    if (tunnel_mode) {
+        UDPpacket packet;
+        int numrecv;
+        while (numrecv) {
+            packet.data = (Uint8*)ne_tunnel_rx;
+            packet.maxlen = 1500;
+            packet.channel = ne_tunnel_chan;
+            numrecv = SDLNet_UDP_Recv(ne_tunnel, &packet);
+            if (numrecv) {
+                theNE2kDevice->rx_frame(packet.data, packet.len);
+                printf("pkt recv [dcr.loop:%u tcr.loop:%u", theNE2kDevice->s.DCR.loop, theNE2kDevice->s.TCR.loop_cntl);
+            }            
+        }
+    }
+    else {
+        while ((res = pcap_next_ex(adhandle, &header, (const u_char**)&pkt_data)) > 0) {
+            //LOG_MSG("NE2000: Received %d bytes", header->len);		
+            // don't receive in loopback modes
+            if ((theNE2kDevice->s.DCR.loop == 0) || (theNE2kDevice->s.TCR.loop_cntl != 0))
+                return;
+            theNE2kDevice->rx_frame(pkt_data, header->len);
+        }
+    }
 }
 #ifdef WIN32
 #include <windows.h>
@@ -1503,12 +1532,10 @@ private:
 	IO_WriteHandleObject WriteHandler16[0x10];
 
 public:
-	/*
-		TODO: option to strip all the pcap out
-	*/
 	bool load_success;
 	NE2K(Section* configuration):Module_base(configuration) {
 		Section_prop * section=static_cast<Section_prop *>(configuration);
+        const char* realnicstring = section->Get_string("realnic");
 
 		load_success = true;
 		// enabled?
@@ -1516,59 +1543,68 @@ public:
 		if(!section->Get_bool("ne2000")) {
 			load_success = false;
 			return;
-		}
+		}                
 
+        if (!strcasecmp(realnicstring, "tunnel")) {
+            tunnel_mode = 1;
+        }
+        else {
+            tunnel_mode = 0;
+        }        
+
+        if(!tunnel_mode) {
 #ifdef WIN32
-/*		
-		int (*PacketSendPacket)(pcap_t *, const u_char *, int);
-		void (*PacketClose)(pcap_t *);
-		void (*PacketFreealldevs)(pcap_if_t *);
-		pcap_t* (*PacketOpen)(char const *,int,int,int,struct pcap_rmtauth *,char *);
-		int (*PacketNextEx)(pcap_t *, struct pcap_pkthdr **, const u_char **);
-		int (*PacketFindALlDevsEx)(char *, struct pcap_rmtauth *, pcap_if_t **, char *);
-*/
-		// init the library
-		HINSTANCE pcapinst;
-		pcapinst = LoadLibrary("WPCAP.DLL");
-		if(pcapinst==NULL) {
-			LOG_MSG("WinPcap has to be installed for the NE2000 to work.");
-			load_success = false;
-			return;
-		}
-		FARPROC psp;
-		
-		psp = GetProcAddress(pcapinst,"pcap_sendpacket");
-		if(!PacketSendPacket) PacketSendPacket =
-			(int (__cdecl *)(pcap_t *,const u_char *,int))psp;
-		
-		psp = GetProcAddress(pcapinst,"pcap_close");
-		if(!PacketClose) PacketClose =
-			(void (__cdecl *)(pcap_t *)) psp;
-		
-		psp = GetProcAddress(pcapinst,"pcap_freealldevs");
-		if(!PacketFreealldevs) PacketFreealldevs =
-			(void (__cdecl *)(pcap_if_t *)) psp;
+            /*
+                    int (*PacketSendPacket)(pcap_t *, const u_char *, int);
+                    void (*PacketClose)(pcap_t *);
+                    void (*PacketFreealldevs)(pcap_if_t *);
+                    pcap_t* (*PacketOpen)(char const *,int,int,int,struct pcap_rmtauth *,char *);
+                    int (*PacketNextEx)(pcap_t *, struct pcap_pkthdr **, const u_char **);
+                    int (*PacketFindALlDevsEx)(char *, struct pcap_rmtauth *, pcap_if_t **, char *);
+            */
+            // init the library
+            HINSTANCE pcapinst;
+            pcapinst = LoadLibrary("WPCAP.DLL");
+            if (pcapinst == NULL) {
+                LOG_MSG("WinPcap has to be installed for the NE2000 to work.");
+                load_success = false;
+                return;
+            }
+            FARPROC psp;
 
-		psp = GetProcAddress(pcapinst,"pcap_open");
-		if(!PacketOpen) PacketOpen =
-			(pcap_t* (__cdecl *)(char const *,int,int,int,struct pcap_rmtauth *,char *)) psp;
+            psp = GetProcAddress(pcapinst, "pcap_sendpacket");
+            if (!PacketSendPacket) PacketSendPacket =
+                (int(__cdecl*)(pcap_t*, const u_char*, int))psp;
 
-		psp = GetProcAddress(pcapinst,"pcap_next_ex");
-		if(!PacketNextEx) PacketNextEx = 
-			(int (__cdecl *)(pcap_t *, struct pcap_pkthdr **, const u_char **)) psp;
+            psp = GetProcAddress(pcapinst, "pcap_close");
+            if (!PacketClose) PacketClose =
+                (void(__cdecl*)(pcap_t*)) psp;
 
-		psp = GetProcAddress(pcapinst,"pcap_findalldevs_ex");
-		if(!PacketFindALlDevsEx) PacketFindALlDevsEx =
-			(int (__cdecl *)(char *, struct pcap_rmtauth *, pcap_if_t **, char *)) psp;
+            psp = GetProcAddress(pcapinst, "pcap_freealldevs");
+            if (!PacketFreealldevs) PacketFreealldevs =
+                (void(__cdecl*)(pcap_if_t*)) psp;
 
-		if(PacketFindALlDevsEx==0 || PacketNextEx==0 || PacketOpen==0 || 
-			PacketFreealldevs==0 || PacketClose==0 || PacketSendPacket==0) {
-			LOG_MSG("Wrong WinPcap version or something");
-			load_success = false;
-			return;
-		}
+            psp = GetProcAddress(pcapinst, "pcap_open");
+            if (!PacketOpen) PacketOpen =
+                (pcap_t * (__cdecl*)(char const*, int, int, int, struct pcap_rmtauth*, char*)) psp;
 
-#endif
+            psp = GetProcAddress(pcapinst, "pcap_next_ex");
+            if (!PacketNextEx) PacketNextEx =
+                (int(__cdecl*)(pcap_t*, struct pcap_pkthdr**, const u_char**)) psp;
+
+            psp = GetProcAddress(pcapinst, "pcap_findalldevs_ex");
+            if (!PacketFindALlDevsEx) PacketFindALlDevsEx =
+                (int(__cdecl*)(char*, struct pcap_rmtauth*, pcap_if_t**, char*)) psp;
+
+            if (PacketFindALlDevsEx == 0 || PacketNextEx == 0 || PacketOpen == 0 ||
+                PacketFreealldevs == 0 || PacketClose == 0 || PacketSendPacket == 0) {
+                LOG_MSG("Wrong WinPcap version or something");
+                load_success = false;
+                return;
+            }
+
+#endif             
+        }
 
 		// get irq and base
 		Bitu irq = (Bitu)section->Get_int("nicirq");
@@ -1598,100 +1634,125 @@ public:
 		}
 
 		// find out which pcap device to use
-		const char* realnicstring=section->Get_string("realnic");
-		pcap_if_t *alldevs;
-		pcap_if_t *currentdev = NULL;
-		char errbuf[PCAP_ERRBUF_SIZE];
-		unsigned int userdev;
-#ifdef WIN32
-		if (pcap_findalldevs_ex(PCAP_SRC_IF_STRING, NULL, &alldevs, errbuf) == -1)
-#else
-		if (pcap_findalldevs(&alldevs, errbuf) == -1)
-#endif
- 		{
-			LOG_MSG("Cannot enumerate network interfaces: %s\n", errbuf);
-			load_success = false;
-			return;
-		}
-		if (!strcasecmp(realnicstring,"list")) {
-			// print list and quit
-			Bitu i = 0;
-			LOG_MSG("\nNetwork Interface List \n-----------------------------------");
-			for(currentdev=alldevs; currentdev!=NULL; currentdev=currentdev->next) {
-				const char* desc = "no description"; 
-				if(currentdev->description) desc=currentdev->description;
-				i++;
-				LOG_MSG("%2d. %s\n    (%s)\n",(int)i,currentdev->name,desc);
-			}
-			pcap_freealldevs(alldevs);
-			load_success = false;
-			return;
-		} else if(1==sscanf(realnicstring,"%u",&userdev)) {
-			// user passed us a number
-			Bitu i = 0;
-			currentdev=alldevs;
-			while(currentdev!=NULL) {
-				i++;
-				if(i==userdev) break;
-				else currentdev=currentdev->next;
-			}
-		} else {
-			// user might have passed a piece of name
-			for(currentdev=alldevs; currentdev!=NULL; currentdev=currentdev->next) {
-				if(strstr(currentdev->name,realnicstring)) {
-					break;
-				}else if(currentdev->description!=NULL &&
-					strstr(currentdev->description,realnicstring)) {
-					break;
-				}
-			}
-		}
+        if (tunnel_mode) {
+            if (SDLNet_Init()) {
+                printf("success init sdl");
+            }
+            else {
+                printf("problems init sdl: %s\n", SDLNet_GetError());
+            }
 
-		if(currentdev==NULL) {
-			LOG_MSG("Unable to find network interface - check realnic parameter\n");
-			load_success = false;
-			pcap_freealldevs(alldevs);
-			return;
-		}
-		// print out which interface we are going to use
-        const char* desc = "no description"; 
-		if(currentdev->description) desc=currentdev->description;
-		LOG_MSG("Using Network interface:\n%s\n(%s)\n",currentdev->name,desc);
-		
-		// attempt to open it
+            printf("Initiate UDP Tunnel");
+            ne_tunnel = SDLNet_UDP_Open(0);
+            if (!ne_tunnel) {
+                printf("SDLNet_UDP_Open: %s\n", SDLNet_GetError());
+            }
+            else {
+                printf("success opening socket");
+            }
+            IPaddress udp_server;
+            SDLNet_ResolveHost(&udp_server, "ipx.yyzkevin.com", 200);
+            ne_tunnel_chan = SDLNet_UDP_Bind(ne_tunnel, -1, &udp_server);
+            printf("tunnel chan: %u\n", ne_tunnel_chan);
+        }
+        else {
+            pcap_if_t* alldevs;
+            pcap_if_t* currentdev = NULL;
+            char errbuf[PCAP_ERRBUF_SIZE];
+            unsigned int userdev;
 #ifdef WIN32
-		if ( (adhandle= pcap_open(
-			currentdev->name, // name of the device
-            65536,            // portion of the packet to capture
-                              // 65536 = whole packet 
-            PCAP_OPENFLAG_PROMISCUOUS,    // promiscuous mode
-            -1,             // read timeout
-            NULL,             // authentication on the remote machine
-            errbuf            // error buffer
-            ) ) == NULL)
+            if (pcap_findalldevs_ex(PCAP_SRC_IF_STRING, NULL, &alldevs, errbuf) == -1)
 #else
-		/*pcap_t *pcap_open_live(const char *device, int snaplen,
+            if (pcap_findalldevs(&alldevs, errbuf) == -1)
+#endif
+            {
+                LOG_MSG("Cannot enumerate network interfaces: %s\n", errbuf);
+                load_success = false;
+                return;
+        }
+            if (!strcasecmp(realnicstring, "list")) {
+                // print list and quit
+                Bitu i = 0;
+                LOG_MSG("\nNetwork Interface List \n-----------------------------------");
+                for (currentdev = alldevs; currentdev != NULL; currentdev = currentdev->next) {
+                    const char* desc = "no description";
+                    if (currentdev->description) desc = currentdev->description;
+                    i++;
+                    LOG_MSG("%2d. %s\n    (%s)\n", (int)i, currentdev->name, desc);
+                }
+                pcap_freealldevs(alldevs);
+                load_success = false;
+                return;
+            }
+            else if (1 == sscanf(realnicstring, "%u", &userdev)) {
+                // user passed us a number
+                Bitu i = 0;
+                currentdev = alldevs;
+                while (currentdev != NULL) {
+                    i++;
+                    if (i == userdev) break;
+                    else currentdev = currentdev->next;
+                }
+            }
+            else {
+                // user might have passed a piece of name
+                for (currentdev = alldevs; currentdev != NULL; currentdev = currentdev->next) {
+                    if (strstr(currentdev->name, realnicstring)) {
+                        break;
+                    }
+                    else if (currentdev->description != NULL &&
+                        strstr(currentdev->description, realnicstring)) {
+                        break;
+                    }
+                }
+            }
+
+            if (currentdev == NULL) {
+                LOG_MSG("Unable to find network interface - check realnic parameter\n");
+                load_success = false;
+                pcap_freealldevs(alldevs);
+                return;
+            }
+            // print out which interface we are going to use
+            const char* desc = "no description";
+            if (currentdev->description) desc = currentdev->description;
+            LOG_MSG("Using Network interface:\n%s\n(%s)\n", currentdev->name, desc);
+
+            // attempt to open it
+#ifdef WIN32
+            if ((adhandle = pcap_open(
+                currentdev->name, // name of the device
+                65536,            // portion of the packet to capture
+                                  // 65536 = whole packet 
+                PCAP_OPENFLAG_PROMISCUOUS,    // promiscuous mode
+                -1,             // read timeout
+                NULL,             // authentication on the remote machine
+                errbuf            // error buffer
+            )) == NULL)
+#else
+        /*pcap_t *pcap_open_live(const char *device, int snaplen,
                int promisc, int to_ms, char *errbuf)*/
-		if ( (adhandle= pcap_open_live(
-			currentdev->name, // name of the device
-            65536,            // portion of the packet to capture
-                              // 65536 = whole packet 
-            true,    // promiscuous mode
-            -1,             // read timeout
-            errbuf            // error buffer
-            ) ) == NULL)
+            if ((adhandle = pcap_open_live(
+                currentdev->name, // name of the device
+                65536,            // portion of the packet to capture
+                                  // 65536 = whole packet 
+                true,    // promiscuous mode
+                -1,             // read timeout
+                errbuf            // error buffer
+            )) == NULL)
 
 #endif        
-        {
-				LOG_MSG("\nUnable to open the interface: %s.", errbuf);
-        	pcap_freealldevs(alldevs);
-			load_success = false;
-			return;
-		}
-		pcap_freealldevs(alldevs);
+            {
+                LOG_MSG("\nUnable to open the interface: %s.", errbuf);
+                pcap_freealldevs(alldevs);
+                load_success = false;
+                return;
+    }
+            pcap_freealldevs(alldevs);
 #ifndef WIN32
-		pcap_setnonblock(adhandle,1,errbuf);
+            pcap_setnonblock(adhandle, 1, errbuf);
 #endif
+        }
 		// create the bochs NIC class
 		theNE2kDevice = new bx_ne2k_c ();
 		memcpy(theNE2kDevice->s.physaddr, mac, 6);
@@ -1716,6 +1777,9 @@ public:
 		adhandle=0;
 		if(theNE2kDevice != 0) delete theNE2kDevice;
 		theNE2kDevice=0;
+
+        //KM-TODO: Teardown UDP Tunnel if in  tunnel mode
+
 		TIMER_DelTickHandler(NE2000_Poller);
 		PIC_RemoveEvents(NE2000_TX_Event);
 	}	
